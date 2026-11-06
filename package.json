@@ -1,6 +1,6 @@
 {
   "name": "dsh-discord-rich",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "private": true,
   "description": "Discord Rich Presence for DeepSeek Harness: open chat title, work status, daily and per-chat tokens.",
   "license": "MIT",

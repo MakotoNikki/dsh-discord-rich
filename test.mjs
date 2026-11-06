@@ -1,8 +1,9 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { DEFAULT_CONFIG, buildActivity, normalizeSessionId, readUsage, sanitizeConfig } from './index.js';
+import { zstdCompressSync } from 'node:zlib';
+import { DEFAULT_CONFIG, buildActivity, normalizeSessionId, readUsage, readUsageNative, sanitizeConfig } from './index.js';
 
 const dir = await mkdtemp(join(tmpdir(), 'dsh-discord-rich-'));
 
@@ -48,6 +49,29 @@ try {
   const missing = await readUsage(dir, 'c'.repeat(8));
   assert.equal(missing.sessionTitle, '');
   assert.equal(missing.sessionTokens, 0);
+
+  const nativeRoot = join(dir, 'native', 'sessions');
+  const nativeId = 'd'.repeat(8);
+  const nativeDir = join(nativeRoot, '--C-work-proj--', `session-${nativeId}`);
+  await mkdir(nativeDir, { recursive: true });
+  const now = Date.now();
+  const nativeEvents = [
+    { type: 'session', version: 4, id: `session-${nativeId}`, createdAt: now - 5000, cwd: 'C:\\work\\proj' },
+    { type: 'user/message', time: now, data: {} },
+    { type: 'session/title', data: { title: 'Native chat' } },
+    { type: 'assistant/message', data: { turn: 1, step: 1, usage: { inputTokens: 100, outputTokens: 20, cacheReadTokens: 30 } } },
+    { type: 'assistant/message', data: { turn: 1, step: 2, usage: { inputTokens: 5, outputTokens: 2, cacheReadTokens: 10 } } },
+    { type: 'assistant/message', data: { turn: 1, step: 2, usage: { inputTokens: 7, outputTokens: 3, cacheReadTokens: 12 } } },
+  ];
+  const nativeFile = join(nativeDir, 'session.v4.jsonl.zstd');
+  await writeFile(nativeFile, Buffer.concat(nativeEvents.map((event) => zstdCompressSync(Buffer.from(`${JSON.stringify(event)}\n`)))));
+  const native = await readUsageNative(nativeRoot, nativeId);
+  assert.equal(native.available, true);
+  assert.equal(native.sessionTitle, 'Native chat');
+  assert.equal(native.sessionTokens, 172);
+  assert.equal(native.todayTokens, 172);
+  assert.equal(native.todaySessions, 1);
+  assert.equal(native.project, 'proj');
 
   const activity = buildActivity({
     language: 'ru',

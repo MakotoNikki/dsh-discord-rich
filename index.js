@@ -1,8 +1,9 @@
 /**
  * dsh-discord-rich — Discord Rich Presence for DeepSeek Harness.
  *
- * Host half: folds the profile's session projection cache into "tokens today",
- * reads the open chat's title and tokens, watches running agents, and publishes
+ * Host half: folds the profile's session projection cache (or the native
+ * session logs when it is unavailable) into "tokens today", reads the open
+ * chat's title and tokens, watches running agents, and publishes
  * all of it to the local Discord client over its IPC pipe. The settings page
  * reads and writes the same values through a loopback-only route.
  */
@@ -10,9 +11,10 @@ import { mkdir, readFile, readdir, rename, stat, writeFile } from 'node:fs/promi
 import { basename, dirname, join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { homedir, tmpdir } from 'node:os';
+import * as zlib from 'node:zlib';
 import net from 'node:net';
 
-const VERSION = '0.3.0';
+const VERSION = '0.3.1';
 const API_PREFIX = '/discord-rich/api';
 const SUMMARY_TTL_MS = 20_000;
 const TICK_MS = 15_000;
@@ -228,6 +230,236 @@ async function readUsage(dir, activeId = '') {
   const selected = active ?? (activeId === '' ? latest : null);
   return {
     available: true,
+    todayTokens,
+    todaySessions,
+    sessionTokens: selected?.tokens ?? 0,
+    sessionTitle: selected?.title ?? '',
+    project: selected === null ? '' : shellDirectoryName(selected.cwd),
+    projectPath: selected?.cwd ?? '',
+    updatedAt: Date.now(),
+  };
+}
+
+const ZSTD_MAGIC = 0xfd2fb528;
+
+function zstdFrames(buffer) {
+  const frames = [];
+  let offset = 0;
+  while (offset + 4 <= buffer.length) {
+    const magic = buffer.readUInt32LE(offset);
+    if ((magic & 0xfffffff0) === 0x184d2a50) {
+      if (offset + 8 > buffer.length) break;
+      offset += 8 + buffer.readUInt32LE(offset + 4);
+      continue;
+    }
+    if (magic !== ZSTD_MAGIC) break;
+    const start = offset;
+    offset += 4;
+    if (offset >= buffer.length) break;
+    const descriptor = buffer[offset++];
+    const contentSizeFlag = (descriptor >> 6) & 3;
+    const singleSegment = (descriptor >> 5) & 1;
+    const checksum = (descriptor >> 2) & 1;
+    const dictionaryFlag = descriptor & 3;
+    if (!singleSegment) offset += 1;
+    offset += [0, 1, 2, 4][dictionaryFlag];
+    offset += contentSizeFlag === 0 ? (singleSegment ? 1 : 0) : contentSizeFlag === 1 ? 2 : contentSizeFlag === 2 ? 4 : 8;
+    while (offset + 3 <= buffer.length) {
+      const header = buffer[offset] | (buffer[offset + 1] << 8) | (buffer[offset + 2] << 16);
+      offset += 3;
+      const last = header & 1;
+      const type = (header >> 1) & 3;
+      offset += type === 1 ? 1 : header >>> 3;
+      if (last) break;
+    }
+    if (checksum) offset += 4;
+    if (offset <= start || offset > buffer.length) break;
+    frames.push(buffer.subarray(start, offset));
+  }
+  return frames;
+}
+
+function nativeUsageOf(event) {
+  if (event?.type === 'assistant/message' && event.data?.usage !== undefined) return event.data.usage;
+  if (event?.type !== 'assistant/message' && event?.type !== 'assistant/attempt') return undefined;
+  const stream = event.data?.stream;
+  if (!Array.isArray(stream)) return undefined;
+  for (let index = stream.length - 1; index >= 0; index -= 1) {
+    const chunk = stream[index]?.chunk;
+    if (chunk?.type === 'usage' && chunk.usage !== undefined) return chunk.usage;
+  }
+  return undefined;
+}
+
+function bucketsOf(usage) {
+  const count = (value) => (Number.isFinite(value) ? Math.max(0, value) : 0);
+  return {
+    uncachedInputTokens: count(usage.inputTokens),
+    outputTokens: count(usage.outputTokens),
+    cacheReadTokens: count(usage.cacheReadTokens),
+    cacheWriteTokens: count(usage.cacheWriteTokens),
+  };
+}
+
+function sameBuckets(left, right) {
+  return left.uncachedInputTokens === right.uncachedInputTokens
+    && left.outputTokens === right.outputTokens
+    && left.cacheReadTokens === right.cacheReadTokens
+    && left.cacheWriteTokens === right.cacheWriteTokens;
+}
+
+function foldNativeUsage(events) {
+  let totals = { uncachedInputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 };
+  let last = null;
+  for (const event of events) {
+    if (event.type === 'llm/retry-started') {
+      if (last !== null && last.turn === event.data?.turn && last.step === event.data?.step) last = null;
+      continue;
+    }
+    if (event.type !== 'assistant/message' && event.type !== 'assistant/attempt') continue;
+    const usage = nativeUsageOf(event);
+    if (usage === undefined) continue;
+    const turn = event.data?.turn;
+    const step = event.data?.step;
+    if (typeof turn !== 'number' || typeof step !== 'number') continue;
+    const buckets = bucketsOf(usage);
+    const previous = last !== null && last.turn === turn && last.step === step ? last.buckets : undefined;
+    if (previous !== undefined && sameBuckets(previous, buckets)) continue;
+    totals = {
+      uncachedInputTokens: totals.uncachedInputTokens - (previous?.uncachedInputTokens ?? 0) + buckets.uncachedInputTokens,
+      outputTokens: totals.outputTokens - (previous?.outputTokens ?? 0) + buckets.outputTokens,
+      cacheReadTokens: totals.cacheReadTokens - (previous?.cacheReadTokens ?? 0) + buckets.cacheReadTokens,
+      cacheWriteTokens: totals.cacheWriteTokens - (previous?.cacheWriteTokens ?? 0) + buckets.cacheWriteTokens,
+    };
+    last = { turn, step, buckets };
+  }
+  return totals;
+}
+
+async function readNativeSession(file) {
+  let buffer;
+  try {
+    buffer = await readFile(file);
+  } catch {
+    return null;
+  }
+  if (typeof zlib.zstdDecompressSync !== 'function') return null;
+  const frames = zstdFrames(buffer);
+  if (frames.length === 0) return null;
+  let text = '';
+  for (const frame of frames) {
+    try {
+      text += zlib.zstdDecompressSync(frame).toString('utf8');
+    } catch {
+      // A session being written can end in a partial frame; use the complete prefix.
+    }
+  }
+  if (text === '') return null;
+  let header = null;
+  let title = '';
+  let lastActiveAt = 0;
+  const events = [];
+  for (const line of text.split(/\r?\n/)) {
+    if (line === '') continue;
+    let event;
+    try {
+      event = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    events.push(event);
+    if (event.type === 'session') header = event;
+    if (event.type === 'session/title' && typeof event.data?.title === 'string' && event.data.title.trim() !== '') {
+      title = event.data.title.trim();
+    }
+    if (event.type === 'user/message' && typeof event.time === 'number') {
+      lastActiveAt = Math.max(lastActiveAt, event.time);
+    }
+  }
+  if (header === null) return null;
+  const totals = foldNativeUsage(events);
+  const tokens = totals.uncachedInputTokens + totals.cacheReadTokens + totals.cacheWriteTokens + totals.outputTokens;
+  const createdAt = typeof header.createdAt === 'number' ? header.createdAt : 0;
+  return {
+    id: normalizeSessionId(typeof header.id === 'string' ? header.id : ''),
+    cwd: typeof header.cwd === 'string' ? header.cwd : '',
+    title,
+    tokens,
+    createdAt,
+    lastActiveAt: lastActiveAt > 0 ? lastActiveAt : createdAt,
+  };
+}
+
+async function readUsageNative(root, activeId = '') {
+  let projects;
+  try {
+    projects = await readdir(root, { withFileTypes: true });
+  } catch {
+    return {
+      available: false,
+      todayTokens: 0,
+      todaySessions: 0,
+      sessionTokens: 0,
+      sessionTitle: '',
+      project: '',
+      projectPath: '',
+      updatedAt: Date.now(),
+    };
+  }
+
+  const dayStart = new Date();
+  dayStart.setHours(0, 0, 0, 0);
+  const todayKey = dayKeyOf(Date.now());
+  const files = [];
+  for (const project of projects) {
+    if (!project.isDirectory()) continue;
+    let sessions;
+    try {
+      sessions = await readdir(join(root, project.name), { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const session of sessions) {
+      if (!session.isDirectory() || !session.name.startsWith('session-')) continue;
+      const dir = join(root, project.name, session.name);
+      let names;
+      try {
+        names = await readdir(dir);
+      } catch {
+        continue;
+      }
+      const name = names.find((candidate) => /^session\.v\d+\.jsonl\.zstd$/.test(candidate));
+      if (name === undefined) continue;
+      const file = join(dir, name);
+      const id = normalizeSessionId(session.name);
+      let info;
+      try {
+        info = await stat(file);
+      } catch {
+        continue;
+      }
+      if (id === activeId || info.mtimeMs >= dayStart.getTime()) files.push(file);
+    }
+  }
+
+  let todayTokens = 0;
+  let todaySessions = 0;
+  let latest = null;
+  let active = null;
+  for (const file of [...new Set(files)]) {
+    const session = await readNativeSession(file);
+    if (session === null) continue;
+    if (activeId !== '' && session.id === activeId) active = session;
+    if (latest === null || session.lastActiveAt > latest.lastActiveAt) latest = session;
+    if (session.tokens > 0 && dayKeyOf(session.lastActiveAt) === todayKey) {
+      todayTokens += session.tokens;
+      todaySessions += 1;
+    }
+  }
+
+  const selected = active ?? (activeId === '' ? latest : null);
+  return {
+    available: latest !== null || active !== null,
     todayTokens,
     todaySessions,
     sessionTokens: selected?.tokens ?? 0,
@@ -576,7 +808,9 @@ export function apply(ctx) {
     ?? process.env.DSH_HOME
     ?? join(process.env.APPDATA ?? process.cwd(), 'dsh-desktop', 'harness');
   const cacheDir = join(home, 'storages', 'session_projcache', 'sessions');
+  const sessionsDir = join(home, 'sessions');
   const configPath = join(home, 'storages', 'dsh-discord-rich', 'config.json');
+  const tokenMeter = ctx.get('tokenMeter');
 
   let config = { ...DEFAULT_CONFIG };
   let workingSince = null;
@@ -593,7 +827,14 @@ export function apply(ctx) {
     if (usagePending !== null && usagePending.id === activeSessionId) return usagePending.promise;
     const id = activeSessionId;
     const entry = { id, promise: null };
-    entry.promise = readUsage(cacheDir, id)
+    const cached = tokenMeter === undefined
+      ? Promise.resolve(null)
+      : readUsage(cacheDir, id).catch(() => null);
+    entry.promise = cached
+      .then((value) => {
+        if (value?.available && (value.todayTokens > 0 || value.sessionTokens > 0 || id === '')) return value;
+        return readUsageNative(sessionsDir, id);
+      })
       .then((value) => {
         if (id === activeSessionId) usageCache = { at: Date.now(), id, value };
         return value;
@@ -749,4 +990,4 @@ export function apply(ctx) {
 }
 
 export const inject = ['webServer'];
-export { buildActivity, normalizeSessionId, readUsage, sanitizeConfig, DEFAULT_CONFIG };
+export { buildActivity, normalizeSessionId, readUsage, readUsageNative, sanitizeConfig, DEFAULT_CONFIG };

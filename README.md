@@ -39,6 +39,8 @@ also speaks English and Chinese.*
   how long the current turn has been going.
 - **Zero setup by default.** A shared Application ID is already filled in. The
   card works as soon as the plugin is installed.
+- **No extra plugin.** Token counts come from DSH's built-in token meter. If it
+  is unavailable, the plugin reads the session log directly.
 - **Three languages.** English, Russian, and Chinese for both the settings and
   the Discord card. English is the default.
 
@@ -107,7 +109,8 @@ nothing, a custom app with your own uploaded asset is the reliable option.
 
 Everything is local.
 
-- The plugin reads token counts from DeepSeek Harness's own `usage-stats` cache.
+- The plugin reads token counts from DSH's built-in session projection cache,
+  or from the session log if that cache is unavailable.
 - It talks to Discord over the local IPC pipe.
 - It does not read, store, or send your Discord token.
 - It does not make network requests.
@@ -127,9 +130,10 @@ Everything is local.
 ## How it works
 
 The web part of the plugin sits in the session header and reports which chat is
-open to the host. The host reads the local `usage-stats` projection cache,
-builds the activity, and sends it to Discord through the local IPC socket. No
-server, no account, no cloud.
+open to the host. The host reads DSH's built-in session projection cache (or the
+native session log if that cache is unavailable), builds the activity, and
+sends it to Discord through the local IPC socket. No server, no account, no
+cloud.
 
 ## For developers
 
