@@ -1,0 +1,74 @@
+{
+  "name": "dsh-discord-rich",
+  "version": "0.3.0",
+  "private": true,
+  "description": "Discord Rich Presence for DeepSeek Harness: open chat title, work status, daily and per-chat tokens.",
+  "license": "MIT",
+  "author": "wisqqud",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/MakotoNikki/dsh-discord-rich.git"
+  },
+  "homepage": "https://github.com/MakotoNikki/dsh-discord-rich#readme",
+  "bugs": {
+    "url": "https://github.com/MakotoNikki/dsh-discord-rich/issues"
+  },
+  "type": "module",
+  "main": "index.js",
+  "engines": {
+    "node": ">=22.19.0",
+    "dsh": ">=0.2.1-rc.1 <0.3.0"
+  },
+  "icon": "./icon.svg",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./icon": "./icon.svg",
+    "./locale/*.json": "./locale/*.json",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg",
+    "assets/icon-1024.png",
+    "assets/readme/*.png",
+    "README.md",
+    "README.ru.md",
+    "README.zh.md",
+    "LICENSE",
+    "CHANGELOG.md"
+  ],
+  "scripts": {
+    "test": "node test.mjs",
+    "check": "node --check index.js && node --check client.js"
+  },
+  "dsh": {
+    "manifestVersion": 1,
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-settings",
+        "@deepseek-ai/dsh-client-ui-conversation",
+        "@deepseek-ai/dsh-client-locale"
+      ]
+    }
+  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "discord",
+    "discord-rpc",
+    "rich-presence",
+    "vesktop",
+    "equicord",
+    "tokens"
+  ]
+}

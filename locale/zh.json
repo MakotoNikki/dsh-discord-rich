@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Discord Rich Presence",
+    "description": "在 Discord 个人资料中显示当前聊天标题、工作状态以及今日和本聊天的 Token 用量。"
+  }
+}

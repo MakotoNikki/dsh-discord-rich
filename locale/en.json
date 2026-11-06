@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Discord Rich Presence",
+    "description": "Shows the open chat title, work status and tokens used today and in this chat in your Discord profile."
+  }
+}

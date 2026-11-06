@@ -1,0 +1,101 @@
+import assert from 'node:assert/strict';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { DEFAULT_CONFIG, buildActivity, normalizeSessionId, readUsage, sanitizeConfig } from './index.js';
+
+const dir = await mkdtemp(join(tmpdir(), 'dsh-discord-rich-'));
+
+function session(title, createdAt, lastPromptAt, tokens) {
+  return {
+    record: {
+      identity: { createdAt, cwd: 'C:\\work\\proj' },
+      rows: {
+        title: { val: title },
+        sessionListMetadata: { val: { lastPromptAt } },
+        tokenUsage: {
+          val: {
+            totals: {
+              uncachedInputTokens: tokens,
+              cacheReadTokens: 0,
+              cacheWriteTokens: 0,
+              outputTokens: 0,
+            },
+          },
+        },
+      },
+    },
+  };
+}
+
+try {
+  assert.equal(normalizeSessionId('session-aaaaaaaa.json'), 'aaaaaaaa');
+  assert.equal(normalizeSessionId('aaaaaaaa'), 'aaaaaaaa');
+  assert.equal(normalizeSessionId(''), '');
+
+  await writeFile(join(dir, `session-${'a'.repeat(8)}.json`), JSON.stringify(session('Old chat', 1, 100, 10)));
+  await writeFile(join(dir, `session-${'b'.repeat(8)}.json`), JSON.stringify(session('Active chat', 2, 200, 30)));
+
+  const active = await readUsage(dir, 'a'.repeat(8));
+  assert.equal(active.sessionTitle, 'Old chat');
+  assert.equal(active.sessionTokens, 10);
+  assert.equal(active.project, 'proj');
+
+  const latest = await readUsage(dir);
+  assert.equal(latest.sessionTitle, 'Active chat');
+  assert.equal(latest.sessionTokens, 30);
+
+  const missing = await readUsage(dir, 'c'.repeat(8));
+  assert.equal(missing.sessionTitle, '');
+  assert.equal(missing.sessionTokens, 0);
+
+  const activity = buildActivity({
+    language: 'ru',
+    showProject: true,
+    showStatus: true,
+    showTokens: true,
+    showTimer: true,
+    largeImage: 'dsh',
+    largeText: '',
+  }, active, false, null);
+  assert.equal(activity.details, 'Old chat');
+  assert.equal(activity.assets.large_text, '10 токенов за чат');
+  assert.equal(activity.state, 'Ожидает  ·  Токенов за день: 0');
+
+  const english = buildActivity({
+    language: 'en',
+    showProject: true,
+    showStatus: true,
+    showTokens: true,
+    showTimer: true,
+    largeImage: 'dsh',
+    largeText: '',
+  }, active, true, 123);
+  assert.equal(english.assets.large_text, '10 tokens in this chat');
+  assert.equal(english.state, 'Working  ·  Total tok/d: 0');
+  assert.deepEqual(english.timestamps, { start: 123 });
+
+  const chinese = buildActivity({
+    language: 'zh',
+    showProject: true,
+    showStatus: true,
+    showTokens: true,
+    showTimer: true,
+    largeImage: 'dsh',
+    largeText: '',
+  }, active, false, null);
+  assert.equal(chinese.assets.large_text, '本聊天 10 token');
+  assert.equal(chinese.state, '空闲  ·  今日 Token：0');
+
+  assert.equal(DEFAULT_CONFIG.clientId, '1567993796355031070');
+  assert.equal(DEFAULT_CONFIG.language, 'en');
+  const russianBase = { ...DEFAULT_CONFIG, language: 'ru' };
+  assert.equal(sanitizeConfig({ showTimer: false }, russianBase).language, 'ru');
+  assert.equal(sanitizeConfig({ language: 'zh' }, russianBase).language, 'zh');
+  assert.equal(sanitizeConfig({ language: 'fr' }, russianBase).language, 'ru');
+  assert.equal(sanitizeConfig({}, DEFAULT_CONFIG).language, 'en');
+
+  console.log('ok');
+} finally {
+  await rm(dir, { recursive: true, force: true });
+}
